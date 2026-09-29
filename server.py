@@ -1,11 +1,22 @@
 """
 Time Complexity Visualizer - Flask Server
-Endpoint: GET /analyze?algo=linear_search&step=10&n_max=10000
+
+Public endpoints (no token needed):
+    GET/POST /analyze          run an analysis and get the chart back
+    GET      /algorithms       list supported algorithms
+    GET      /health
+    POST     /register         create a user
+    POST     /login            get a Bearer token
+
+Protected endpoint (needs  Authorization: Bearer <token>):
+    POST     /save_analysis    run an analysis AND save it to the database
 """
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, g
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy.exc import SQLAlchemyError
+from werkzeug.security import generate_password_hash, check_password_hash
+import jwt
 import matplotlib.ticker as ticker
 import matplotlib.pyplot as plt
 import os
@@ -14,8 +25,9 @@ import time
 import math
 import json
 import traceback
+from functools import wraps
 from io import BytesIO
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import matplotlib
@@ -29,23 +41,42 @@ SNAPSHOTS_DIR = os.path.join(BASE_DIR, "snapshots")
 os.makedirs(SNAPSHOTS_DIR, exist_ok=True)
 
 # ─────────────────────────────────────────────
-#  Database (SQLAlchemy)
+#  Config
+#  Set SECRET_KEY (and DATABASE_URL if you want MySQL) as environment variables.
 # ─────────────────────────────────────────────
-app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///" + \
-    os.path.join(BASE_DIR, "analyses.db")
+app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get(
+    "DATABASE_URL",
+    "sqlite:///" + os.path.join(BASE_DIR, "analyses.db"),
+)
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-secret-change-me")
+TOKEN_LIFETIME = timedelta(hours=1)
 
 db = SQLAlchemy(app)
 
 
+# ─────────────────────────────────────────────
+#  Models
+# ─────────────────────────────────────────────
+class User(db.Model):
+    __tablename__ = "users"
+
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(50), unique=True,
+                         nullable=False, index=True)
+    password_hash = db.Column(db.String(255), nullable=False)
+    created_at = db.Column(
+        db.DateTime, default=datetime.utcnow, nullable=False)
+
+
 class Analysis(db.Model):
-    """One row per /analyze run."""
+    """One row per saved analysis run."""
     __tablename__ = "analyses"
 
     id = db.Column(db.Integer, primary_key=True)
     created_at = db.Column(
         db.DateTime, default=datetime.utcnow, nullable=False)
-    method = db.Column(db.String(4), nullable=False)          # "GET" or "POST"
+    method = db.Column(db.String(4), nullable=False)
     step = db.Column(db.Integer, nullable=False)
     n_min = db.Column(db.Integer, nullable=False, default=0)
     n_max = db.Column(db.Integer, nullable=False)
@@ -81,7 +112,7 @@ class Analysis(db.Model):
 
 
 class AlgorithmResult(db.Model):
-    """One row per algorithm per analysis run."""
+    """One row per algorithm per saved analysis."""
     __tablename__ = "algorithm_results"
 
     id = db.Column(db.Integer, primary_key=True)
@@ -132,6 +163,57 @@ def save_analysis(method, requested, step, n_max, algo_data,
         db.session.rollback()
         raise
     return analysis
+
+
+# ─────────────────────────────────────────────
+#  Authentication (JWT Bearer tokens)
+# ─────────────────────────────────────────────
+def unauthorized(message: str):
+    resp = jsonify({"error": message})
+    resp.status_code = 401
+    resp.headers["WWW-Authenticate"] = 'Bearer realm="save_analysis"'
+    return resp
+
+
+def create_token(user: User) -> str:
+    payload = {
+        "sub": str(user.id),
+        "iat": datetime.now(timezone.utc),
+        "exp": datetime.now(timezone.utc) + TOKEN_LIFETIME,
+    }
+    return jwt.encode(payload, app.config["SECRET_KEY"], algorithm="HS256")
+
+
+def token_required(view):
+    """Reject the request with 401 unless it carries a valid Bearer token."""
+    @wraps(view)
+    def wrapper(*args, **kwargs):
+        header = request.headers.get("Authorization", "")
+        if not header.startswith("Bearer "):
+            return unauthorized("I don't know you. Bye.")
+
+        token = header[len("Bearer "):].strip()
+        if not token:
+            return unauthorized("I don't know you. Bye.")
+
+        try:
+            payload = jwt.decode(
+                token, app.config["SECRET_KEY"], algorithms=["HS256"])
+        except jwt.ExpiredSignatureError:
+            return unauthorized("Your token expired. I don't know you anymore. Bye.")
+        except jwt.InvalidTokenError:
+            return unauthorized("I don't know you. Bye.")
+
+        try:
+            user = db.session.get(User, int(payload["sub"]))
+        except (KeyError, ValueError, TypeError):
+            return unauthorized("I don't know you. Bye.")
+        if user is None:
+            return unauthorized("I don't know you. Bye.")
+
+        g.current_user = user
+        return view(*args, **kwargs)
+    return wrapper
 
 
 # ─────────────────────────────────────────────
@@ -307,133 +389,24 @@ def build_chart(algos: list[str], step: int, n_max: int) -> tuple[plt.Figure, np
 
 
 # ─────────────────────────────────────────────
-#  /analyze endpoint (GET)
+#  Shared analysis logic
 # ─────────────────────────────────────────────
-@app.route("/analyze", methods=["GET"])
-def analyze():
-    algo_raw = request.args.get("algo", "")
-    step_raw = request.args.get("step", "10")
-    n_max_raw = request.args.get("n_max", "1000")
-
+def run_analysis(algo_raw, step_raw, n_max_raw):
+    """
+    Validate the parameters, draw the chart, save the PNG snapshot.
+    Returns (data, None) on success or (None, (json_response, status)) on error.
+    """
     # algo
     if not algo_raw:
-        return jsonify({"error": "Missing required parameter: algo",
-                        "valid_algorithms": sorted(VALID_ALGOS)}), 400
-    requested = parse_algos(algo_raw)
-    unknown = [a for a in requested if a not in VALID_ALGOS]
+        return None, (jsonify({"error": "Missing required parameter: algo",
+                               "valid_algorithms": sorted(VALID_ALGOS)}), 400)
+    requested = algo_raw if isinstance(
+        algo_raw, list) else parse_algos(algo_raw)
+    unknown = [a for a in requested
+               if not isinstance(a, str) or a not in VALID_ALGOS]
     if unknown:
-        return jsonify({"error": f"Unknown algorithm(s): {unknown}",
-                        "valid_algorithms": sorted(VALID_ALGOS)}), 400
-
-    # step
-    try:
-        step = int(step_raw.replace(",", ""))
-        if step < 1:
-            raise ValueError
-    except ValueError:
-        return jsonify({"error": f"Invalid step value: {step_raw!r}. Must be a positive integer."}), 400
-
-    # n_max
-    try:
-        n_max = int(n_max_raw.replace(",", ""))
-        if n_max < step:
-            raise ValueError("n_max must be >= step")
-    except ValueError as exc:
-        return jsonify({"error": f"Invalid n_max value: {n_max_raw!r}. {exc}"}), 400
-
-    # generate chart
-    t0 = time.perf_counter()
-    try:
-        fig, x_vals = build_chart(requested, step, n_max)
-    except Exception as exc:
-        traceback.print_exc()
-        return jsonify({"error": f"Chart generation failed: {exc}"}), 500
-
-    # save snapshot
-    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
-    filename = f"complexity_{ts}.png"
-    filepath = os.path.join(SNAPSHOTS_DIR, filename)
-    fig.savefig(filepath, dpi=120, bbox_inches="tight",
-                facecolor=fig.get_facecolor())
-
-    # encode to base64
-    buf = BytesIO()
-    fig.savefig(buf, format="png", dpi=120, bbox_inches="tight",
-                facecolor=fig.get_facecolor())
-    buf.seek(0)
-    img_b64 = base64.b64encode(buf.read()).decode("utf-8")
-    plt.close(fig)
-
-    elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
-
-    # build per-algo data
-    algo_data = {}
-    x_list = list(x_vals)
-    for name in requested:
-        info = ALGORITHMS[name]
-        ops = [info["ops_fn"](xi) for xi in x_list]
-        algo_data[name] = {
-            "label": info["label"],
-            "complexity": info["complexity"],
-            "ops_at_n_max": round(ops[-1], 4) if ops else None,
-        }
-
-    # save to database
-    try:
-        analysis = save_analysis("GET", requested, step, n_max, algo_data,
-                                 filepath, elapsed_ms, img_b64)
-    except SQLAlchemyError as exc:
-        traceback.print_exc()
-        return jsonify({"error": f"Database save failed: {exc}"}), 500
-
-    response = {
-        "status": "ok",
-        "analysis_id": analysis.id,
-        "parameters": {
-            "algorithms": requested,
-            "step": step,
-            "n_min": 0,
-            "n_max": n_max,
-        },
-        "algorithms": algo_data,
-        "snapshot_path": filepath,
-        "elapsed_ms": elapsed_ms,
-        "image_base64": img_b64,
-    }
-    return jsonify(response), 200
-
-
-# ─────────────────────────────────────────────
-#  /analyze endpoint (POST)
-# ─────────────────────────────────────────────
-@app.route("/analyze", methods=["POST"])
-def analyze_post():
-    # get the JSON body from the request
-    body = request.get_json(silent=True)
-
-    if not body:
-        return jsonify({"error": "Request body must be JSON"}), 400
-
-    # extract parameters from the body instead of the URL
-    algo_raw = body.get("algo", "")
-    step_raw = str(body.get("step", "10"))
-    n_max_raw = str(body.get("n_max", "1000"))
-
-    # algo
-    if not algo_raw:
-        return jsonify({"error": "Missing required parameter: algo",
-                        "valid_algorithms": sorted(VALID_ALGOS)}), 400
-
-    # handle both string and list formats
-    if isinstance(algo_raw, list):
-        requested = algo_raw
-    else:
-        requested = parse_algos(algo_raw)
-
-    unknown = [a for a in requested if a not in VALID_ALGOS]
-    if unknown:
-        return jsonify({"error": f"Unknown algorithm(s): {unknown}",
-                        "valid_algorithms": sorted(VALID_ALGOS)}), 400
+        return None, (jsonify({"error": f"Unknown algorithm(s): {unknown}",
+                               "valid_algorithms": sorted(VALID_ALGOS)}), 400)
 
     # step
     try:
@@ -441,7 +414,7 @@ def analyze_post():
         if step < 1:
             raise ValueError
     except ValueError:
-        return jsonify({"error": f"Invalid step value: {step_raw}"}), 400
+        return None, (jsonify({"error": f"Invalid step value: {step_raw!r}. Must be a positive integer."}), 400)
 
     # n_max
     try:
@@ -449,7 +422,7 @@ def analyze_post():
         if n_max < step:
             raise ValueError("n_max must be >= step")
     except ValueError as exc:
-        return jsonify({"error": f"Invalid n_max value: {n_max_raw}. {exc}"}), 400
+        return None, (jsonify({"error": f"Invalid n_max value: {n_max_raw!r}. {exc}"}), 400)
 
     # generate chart
     t0 = time.perf_counter()
@@ -457,7 +430,7 @@ def analyze_post():
         fig, x_vals = build_chart(requested, step, n_max)
     except Exception as exc:
         traceback.print_exc()
-        return jsonify({"error": f"Chart generation failed: {exc}"}), 500
+        return None, (jsonify({"error": f"Chart generation failed: {exc}"}), 500)
 
     # save snapshot
     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
@@ -475,6 +448,7 @@ def analyze_post():
 
     elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
 
+    # per-algo data
     algo_data = {}
     for name in requested:
         info = ALGORITHMS[name]
@@ -485,28 +459,145 @@ def analyze_post():
             "ops_at_n_max": round(ops[-1], 4) if ops else None,
         }
 
-    # save to database
+    return {
+        "requested": requested,
+        "step": step,
+        "n_max": n_max,
+        "algo_data": algo_data,
+        "filepath": filepath,
+        "elapsed_ms": elapsed_ms,
+        "img_b64": img_b64,
+    }, None
+
+
+def build_payload(data: dict, **extra) -> dict:
+    return {
+        "status": "ok",
+        **extra,
+        "parameters": {
+            "algorithms": data["requested"],
+            "step": data["step"],
+            "n_min": 0,
+            "n_max": data["n_max"],
+        },
+        "algorithms": data["algo_data"],
+        "snapshot_path": data["filepath"],
+        "elapsed_ms": data["elapsed_ms"],
+        "image_base64": data["img_b64"],
+    }
+
+
+# ─────────────────────────────────────────────
+#  /analyze – PUBLIC (no token needed)
+# ─────────────────────────────────────────────
+@app.route("/analyze", methods=["GET"])
+def analyze():
+    data, error = run_analysis(
+        request.args.get("algo", ""),
+        request.args.get("step", "10"),
+        request.args.get("n_max", "1000"),
+    )
+    if error:
+        return error
+    return jsonify(build_payload(data)), 200
+
+
+@app.route("/analyze", methods=["POST"])
+def analyze_post():
+    body = request.get_json(silent=True)
+    if not body:
+        return jsonify({"error": "Request body must be JSON"}), 400
+
+    data, error = run_analysis(
+        body.get("algo", ""),
+        body.get("step", "10"),
+        body.get("n_max", "1000"),
+    )
+    if error:
+        return error
+    return jsonify(build_payload(data, method="POST")), 200
+
+
+# ─────────────────────────────────────────────
+#  /save_analysis – PROTECTED (401 without a valid token)
+# ─────────────────────────────────────────────
+@app.route("/save_analysis", methods=["POST"])
+@token_required
+def save_analysis_endpoint():
+    body = request.get_json(silent=True)
+    if not body:
+        return jsonify({"error": "Request body must be JSON"}), 400
+
+    data, error = run_analysis(
+        body.get("algo", ""),
+        body.get("step", "10"),
+        body.get("n_max", "1000"),
+    )
+    if error:
+        return error
+
     try:
-        analysis = save_analysis("POST", requested, step, n_max, algo_data,
-                                 filepath, elapsed_ms, img_b64)
+        analysis = save_analysis("POST", data["requested"], data["step"],
+                                 data["n_max"], data["algo_data"],
+                                 data["filepath"], data["elapsed_ms"],
+                                 data["img_b64"])
     except SQLAlchemyError as exc:
         traceback.print_exc()
         return jsonify({"error": f"Database save failed: {exc}"}), 500
 
+    return jsonify(build_payload(
+        data,
+        method="POST",
+        analysis_id=analysis.id,
+        saved_by=g.current_user.username,
+    )), 201
+
+
+# ─────────────────────────────────────────────
+#  /register and /login – get a token
+# ─────────────────────────────────────────────
+@app.route("/register", methods=["POST"])
+def register():
+    body = request.get_json(silent=True) or {}
+    username = str(body.get("username", "")).strip()
+    password = str(body.get("password", ""))
+
+    if not (3 <= len(username) <= 50):
+        return jsonify({"error": "username must be 3-50 characters"}), 400
+    if len(password) < 8:
+        return jsonify({"error": "password must be at least 8 characters"}), 400
+
+    if User.query.filter_by(username=username).first():
+        return jsonify({"error": "username already taken"}), 409
+
+    user = User(username=username,
+                password_hash=generate_password_hash(password))
+    try:
+        db.session.add(user)
+        db.session.commit()
+    except SQLAlchemyError as exc:
+        db.session.rollback()
+        traceback.print_exc()
+        return jsonify({"error": f"Database error: {exc}"}), 500
+
+    return jsonify({"status": "ok", "user_id": user.id,
+                    "username": user.username}), 201
+
+
+@app.route("/login", methods=["POST"])
+def login():
+    body = request.get_json(silent=True) or {}
+    username = str(body.get("username", "")).strip()
+    password = str(body.get("password", ""))
+
+    user = User.query.filter_by(username=username).first()
+    if user is None or not check_password_hash(user.password_hash, password):
+        return unauthorized("Invalid username or password.")
+
     return jsonify({
-        "status": "ok",
-        "method": "POST",
-        "analysis_id": analysis.id,
-        "parameters": {
-            "algorithms": requested,
-            "step": step,
-            "n_min": 0,
-            "n_max": n_max,
-        },
-        "algorithms": algo_data,
-        "snapshot_path": filepath,
-        "elapsed_ms": elapsed_ms,
-        "image_base64": img_b64,
+        "token": create_token(user),
+        "token_type": "Bearer",
+        "expires_in": int(TOKEN_LIFETIME.total_seconds()),
     }), 200
 
 
@@ -564,7 +655,7 @@ if __name__ == "__main__":
     print(f"  Supported algorithms: {', '.join(sorted(ALGORITHMS.keys()))}")
     print(f"  Snapshots saved to:   {SNAPSHOTS_DIR}")
     print()
-    print("  Example:")
-    print("  http://localhost:8000/analyze?algo=linear_search,bubble_sort&step=10&n_max=1000")
+    print("  Public:    /analyze  /algorithms  /health  /register  /login")
+    print("  Protected: /save_analysis  (Authorization: Bearer <token>)")
     print()
     app.run(host="0.0.0.0", port=8000, debug=False)
